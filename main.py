@@ -1,11 +1,14 @@
-from fastapi import FastAPI, Request, HTTPException, Body
-from fastapi.responses import PlainTextResponse
+from fastapi import FastAPI, Request, HTTPException, Body, UploadFile, File, Form
+from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 from datetime import datetime
 from bson import ObjectId
 from dotenv import load_dotenv
 from backend.routes import chats
 import os
 import requests  # pip install requests
+import shutil
+import uuid
 from pymongo import MongoClient
 
 load_dotenv()
@@ -65,40 +68,51 @@ async def receive_webhook(request: Request):
     return {"status": "received"}
 
 @app.post("/api/messages")
-async def save_message(request: Request):
+async def save_message_file(
+    chatId: str = Form(...),
+    senderId: str = Form(...),
+    content: str = Form(...),
+    file: UploadFile = File(None)  # Optional
+):
     try:
-        data = await request.json()
-        # Validar campos mínimos
-        required_fields = ["chatId", "senderId", "content"]
-        for f in required_fields:
-            if f not in data:
-                raise HTTPException(status_code=400, detail=f"Missing field: {f}")
+        file_url = None
+        if file:
+            # Ensure uploads folder exists
+            os.makedirs("uploads/messages", exist_ok=True)
 
+            # Save file with a unique name
+            filename = f"{uuid.uuid4().hex}_{file.filename}"
+            file_path = os.path.join("uploads/messages", filename)
+
+            with open(file_path, "wb") as buffer:
+                shutil.copyfileobj(file.file, buffer)
+
+            file_url = f"https://bricopoxi.com/uploads/messages/{filename}"
+
+        # Save message to DB
         message_doc = {
-            "chatWaId": data["chatId"],
-            "sender": data["senderId"],
-            "content": data["content"],
+            "chatWaId": chatId,
+            "sender": senderId,
+            "content": content,
             "timestamp": datetime.utcnow(),
-            "status": data.get("status", "sent"),  # por defecto "sent"
+            "status": "sent",
+            "file": file_url
         }
 
         result = db.messages.insert_one(message_doc)
         message_doc["_id"] = result.inserted_id
-        # Actualizar el chat con el último mensaje y timestamp
+
         db.chats.update_one(
-            {"contactWaId": data["chatId"]},
+            {"contactWaId": chatId},
             {
                 "$set": {
-                    "lastMessage": data["content"],
+                    "lastMessage": content,
                     "timestamp": message_doc["timestamp"],
                 },
-                "$inc": {
-                    "unreadCount": 1
-                }
+                "$inc": {"unreadCount": 1}
             }
         )
 
-        # Devolver el mensaje guardado con ID y timestamp en milisegundos
         return {
             "id": str(message_doc["_id"]),
             "chatId": message_doc["chatWaId"],
@@ -106,10 +120,11 @@ async def save_message(request: Request):
             "content": message_doc["content"],
             "timestamp": message_doc["timestamp"].timestamp() * 1000,
             "status": message_doc["status"],
+            "file": file_url
         }
 
     except Exception as e:
-        print(f"❌ Error saving message: {e}")
+        print(f"❌ Error saving message with file: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 @app.post("/send")
@@ -152,7 +167,8 @@ async def get_messages(chat_id: str):
             "senderId": msg["sender"],
             "content": msg["content"],
             "timestamp": msg["timestamp"].timestamp() * 1000,
-            "status": msg["status"]
+            "status": msg["status"],
+            "file": msg.get("file")
         })
 
     db.chats.update_one(
@@ -176,3 +192,5 @@ def send_whatsapp_message(to, text):
     response = requests.post(WHATSAPP_API_URL, headers=headers, json=data)
     print(f"Sent message to {to}, response: {response.status_code} - {response.text}")
 
+
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
