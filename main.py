@@ -69,91 +69,108 @@ async def receive_webhook(request: Request):
 
 @app.post("/api/messages")
 async def save_message_file(
+    id: str = Form(...),
     chatId: str = Form(...),
     senderId: str = Form(...),
-    content: str = Form(...),
-    file: UploadFile = File(None)  # Optional
+    content: str = Form(""),
+    timestamp: str = Form(...),
+    file: UploadFile = File(None),
+    referenceId: str = Form(None)
 ):
     try:
         file_url = None
-        if file:
-            # Ensure uploads folder exists
-            os.makedirs("uploads/messages", exist_ok=True)
+        file_name = None
 
-            # Save file with a unique name
-            filename = f"{uuid.uuid4().hex}_{file.filename}"
-            file_path = os.path.join("uploads/messages", filename)
+        if file:
+            os.makedirs("uploads/messages", exist_ok=True)
+            file_name = file.filename
+            unique_name = f"{uuid.uuid4().hex}_{file.filename}"
+            file_path = os.path.join("uploads/messages", unique_name)
 
             with open(file_path, "wb") as buffer:
                 shutil.copyfileobj(file.file, buffer)
 
-            file_url = f"https://bricopoxi.com/uploads/messages/{filename}"
+            file_url = f"https://bricopoxi.com/uploads/messages/{unique_name}"
 
-        # Save message to DB
+        # Convert timestamp to datetime
+        try:
+            ts = datetime.fromtimestamp(float(timestamp) / 1000)
+        except Exception:
+            ts = datetime.utcnow()
+
         message_doc = {
+            "_id": id,  # Use client-generated ID directly
             "chatWaId": chatId,
             "sender": senderId,
-            "content": content,
-            "timestamp": datetime.utcnow(),
+            "content": content.strip() or None,
+            "timestamp": ts,
             "status": "sent",
-            "file": file_url
+            "file": file_url,
+            "fileName": file_name,
+            "referenceId": referenceId
         }
 
-        result = db.messages.insert_one(message_doc)
-        message_doc["_id"] = result.inserted_id
+        db.messages.insert_one(message_doc)
 
         db.chats.update_one(
             {"contactWaId": chatId},
             {
                 "$set": {
-                    "lastMessage": content,
-                    "timestamp": message_doc["timestamp"],
+                    "lastMessage": content or file_name,
+                    "timestamp": ts,
                 },
                 "$inc": {"unreadCount": 1}
-            }
+            },
+            upsert=True  # 👈 In case chat does not exist
         )
 
         return {
-            "id": str(message_doc["_id"]),
-            "chatId": message_doc["chatWaId"],
-            "senderId": message_doc["sender"],
-            "content": message_doc["content"],
-            "timestamp": message_doc["timestamp"].timestamp() * 1000,
-            "status": message_doc["status"],
-            "file": file_url
+            "id": id,
+            "chatId": chatId,
+            "senderId": senderId,
+            "content": content,
+            "timestamp": ts.timestamp() * 1000,
+            "status": "sent",
+            "file": file_url,
+            "fileName": file_name,
+            "referenceId": referenceId
         }
 
     except Exception as e:
-        print(f"❌ Error saving message with file: {e}")
+        print(f"❌ Error saving message: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
-@app.post("/send")
-async def send_message(request: Request):
-    body = await request.json()
-    to = body.get("to")
-    text = body.get("text")
-    send_whatsapp_message(to, text)
-    return {"status": "message sent"}
 
 @app.get("/api/chats")
 async def get_chats():
-    chats_cursor = db.chats.find()
-    contacts = {c["waId"]: c for c in db.contacts.find()}
+    try:
+        chats_cursor = db.chats.find()
+        contacts = {c["waId"]: c for c in db.contacts.find()}
 
-    chats = []
-    for chat in chats_cursor:
-        waId = chat["contactWaId"]
-        contact = contacts.get(waId, {})
-        chats.append({
-            "id": waId,
-            "name": contact.get("name", "Unknown"),
-            "picture": contact.get("profilePic"),
-            "lastMessage": chat.get("lastMessage"),
-            "timestamp": chat.get("timestamp").timestamp() * 1000,
-            "unreadCount": chat.get("unreadCount", 0),
-            "isTyping": chat.get("isTyping", False),
-        })
-    return chats
+        chats = []
+        for chat in chats_cursor:
+            waId = chat.get("contactWaId")
+            if not waId:
+                continue
+
+            contact = contacts.get(waId, {})
+            timestamp = chat.get("timestamp", datetime.utcnow())
+
+            chats.append({
+                "id": waId,
+                "name": contact.get("name", "Unknown"),
+                "picture": contact.get("profilePic"),
+                "lastMessage": chat.get("lastMessage", ""),
+                "timestamp": timestamp.timestamp() * 1000,
+                "unreadCount": chat.get("unreadCount", 0),
+                "isTyping": chat.get("isTyping", False),
+            })
+        return chats
+
+    except Exception as e:
+        print("Error in /api/chats:", e)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 @app.get("/api/messages/{chat_id}")
 async def get_messages(chat_id: str):
@@ -162,14 +179,16 @@ async def get_messages(chat_id: str):
     messages = []
     for msg in messages_cursor:
         messages.append({
-            "id": str(msg["_id"]),
-            "chatId": msg["chatWaId"],
-            "senderId": msg["sender"],
-            "content": msg["content"],
-            "timestamp": msg["timestamp"].timestamp() * 1000,
-            "status": msg["status"],
-            "file": msg.get("file")
-        })
+          "id": str(msg["_id"]),
+          "chatId": msg["chatWaId"],
+          "senderId": msg["sender"],
+          "content": msg.get("content"),
+          "timestamp": msg["timestamp"].timestamp() * 1000,
+          "status": msg["status"],
+          "file": msg.get("file"),
+          "fileName": msg.get("fileName")  # 👈 Add this
+      })
+
 
     db.chats.update_one(
         {"contactWaId": chat_id},
