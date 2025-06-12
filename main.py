@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, HTTPException, Body, UploadFile, File, Form
+from fastapi import FastAPI, Request, HTTPException, Body, UploadFile, File, Form, Query, Path
 from fastapi.responses import PlainTextResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime
@@ -10,6 +10,8 @@ import requests
 import shutil
 import uuid
 from pymongo import MongoClient
+from pydantic import BaseModel
+
 
 load_dotenv()
 app = FastAPI()
@@ -21,6 +23,11 @@ WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL")
 MONGO_URL = os.getenv("MONGO_URL", "mongodb://localhost:27017")
 client = MongoClient(MONGO_URL)
 db = client["whatsapp"]
+
+
+class ParticipantAction(BaseModel):
+    groupWaId: str
+    waId: str
 
 @app.get("/")
 async def root():
@@ -70,9 +77,16 @@ async def save_message_file(
     content: str = Form(""),
     timestamp: str = Form(...),
     file: UploadFile = File(None),
-    referenceId: str = Form(None)
+    referenceContent: str = Form(None)
 ):
     try:
+
+        # Check if chat is blocked
+        chat = db.chats.find_one({"waId": chatId})
+        if chat and chat.get("isBlocked") is True:
+            print(f"⚠️ Message to blocked chat {chatId} ignored.")
+            raise HTTPException(status_code=403, detail="This chat is blocked. Message not saved.")
+
         file_url = None
         file_name = None
 
@@ -101,7 +115,7 @@ async def save_message_file(
             "status": "sent",
             "file": file_url,
             "fileName": file_name,
-            "referenceId": referenceId
+            "referenceContent": referenceContent
         }
 
         db.messages.insert_one(message_doc)
@@ -127,7 +141,7 @@ async def save_message_file(
             "status": "sent",
             "file": file_url,
             "fileName": file_name,
-            "referenceId": referenceId
+            "referenceContent": referenceContent
         }
 
     except Exception as e:
@@ -158,8 +172,10 @@ async def get_chats_api():
                     p_contact = contacts_map.get(p_raw["waId"])
                     participants_list.append({
                         "waId": p_raw["waId"],
-                        "name": p_contact.get("name") if p_contact else p_raw.get("name", p_raw["waId"])
+                        "name": p_contact.get("name") if p_contact else p_raw.get("name", p_raw["waId"]),
+                        "isAdmin": p_raw.get("isAdmin", True)
                     })
+
             else:
                 contact = contacts_map.get(wa_id)
                 if contact:
@@ -179,7 +195,10 @@ async def get_chats_api():
                 "unreadCount": chat_doc.get("unreadCount", 0),
                 "isTyping": chat_doc.get("isTyping", False),
                 "isGroup": is_group,
-                "participants": participants_list if is_group else []
+                "participants": participants_list if is_group else [],
+                "isPinned": chat_doc.get("isPinned", False),
+                "isMuted": chat_doc.get("isMuted", False),
+                "isBlocked": chat_doc.get("isBlocked", False)
             })
         return response_chats
 
@@ -203,7 +222,9 @@ async def get_messages(chat_id: str):
             "timestamp": msg["timestamp"].timestamp() * 1000,
             "status": msg["status"],
             "file": msg.get("file"),
-            "fileName": msg.get("fileName")
+            "fileName": msg.get("fileName"),
+            "referencedContent": msg.get("referenceContent"),
+            "reactions": msg.get("reactions", [])
         })
 
     db.chats.update_one(
@@ -239,6 +260,184 @@ def send_whatsapp_message(to, text, message_db_id=None):
         except Exception as e:
             print(f"Error parsing WABA response or updating DB with waba_message_id: {e}")
     return response
+
+@app.post("/api/messages/react")
+async def react_to_message(data: dict = Body(...)):
+    message_id = data.get("messageId")
+    requester_id = data.get("requesterId")
+    emoji = data.get("emoji")
+    chat_id = data.get("chatId")  # Por si lo necesitas luego
+
+    if not message_id or not requester_id or not emoji:
+        raise HTTPException(status_code=400, detail="Missing fields")
+
+    try:
+        # Verificamos que el mensaje exista
+        message = db.messages.find_one({"_id": message_id})
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        # Eliminamos reacción previa del mismo usuario, si existe
+        db.messages.update_one(
+            {"_id": message_id},
+            {"$pull": {"reactions": {"user": requester_id}}}
+        )
+
+        # Añadimos la nueva reacción
+        db.messages.update_one(
+            {"_id": message_id},
+            {"$push": {"reactions": {"user": requester_id, "emoji": emoji}}}
+        )
+
+        return {"success": True, "message": "Reaction updated"}
+
+    except Exception as e:
+        print(f"❌ Error updating reaction: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/chat/pin")
+async def pin_unpin_chat(data: dict = Body(...)):
+    try:
+        waId = data.get("waId")
+        if not waId:
+            raise HTTPException(status_code=400, detail="Missing waId")
+
+        chat_doc = db.chats.find_one({"waId": waId})
+        if not chat_doc:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        # Obtener valor actual o False si no existe
+        is_pinned = chat_doc.get("isPinned", False)
+
+        # Invertir pin
+        result = db.chats.update_one(
+            {"waId": waId},
+            {"$set": {
+                "isPinned": not is_pinned,
+            }}
+        )
+        return {"success": True, "isPinned": not is_pinned}
+
+    except HTTPException:
+        raise  # Re-lanza excepciones HTTP personalizadas
+    except Exception as e:
+        print(f"❌ Error in pin_unpin_chat: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+
+@app.post("/api/chat/mute")
+async def mute_unmute_chat(data: dict = Body(...)):
+    try:
+        waId = data.get("waId")
+        if not waId:
+            raise HTTPException(status_code=400, detail="Missing waId")
+
+        chat_doc = db.chats.find_one({"waId": waId})
+        if not chat_doc:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        # Obtener valor actual o False si no existe
+        is_muted = chat_doc.get("isMuted", False)
+
+        # Invertir mute, mantener el valor de pin
+        result = db.chats.update_one(
+            {"waId": waId},
+            {"$set": {
+                "isMuted": not is_muted,
+            }}
+        )
+        return {"success": True, "isMuted": not is_muted}
+
+    except HTTPException:
+        raise  # Re-lanza excepciones HTTP personalizadas
+    except Exception as e:
+        print(f"❌ Error in mute_unmute_chat: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+
+@app.post("/api/chat/block")
+async def mute_unmute_chat(data: dict = Body(...)):
+    try:
+        waId = data.get("waId")
+        if not waId:
+            raise HTTPException(status_code=400, detail="Missing waId")
+
+        chat_doc = db.chats.find_one({"waId": waId})
+        if not chat_doc:
+            raise HTTPException(status_code=404, detail="Chat not found")
+
+        # Obtener valor actual o False si no existe
+        is_blocked = chat_doc.get("isBlocked", False)
+
+        print("isBlocked: ", is_blocked, " not blocked: ", not is_blocked)
+        # Invertir block, mantener el valor de pin
+        result = db.chats.update_one(
+            {"waId": waId},
+            {"$set": {
+                "isBlocked": not is_blocked,
+            }}
+        )
+        return {"success": True, "isBlocked": not is_blocked}
+
+    except HTTPException:
+        raise  # Re-lanza excepciones HTTP personalizadas
+    except Exception as e:
+        print(f"❌ Error in mute_unmute_chat: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+@app.get("/api/contacts")
+async def get_contacts():
+    try:
+        contact_docs = list(db.contacts.find())
+        contacts = []
+
+        for c in contact_docs:
+            contacts.append({
+                "id": c["waId"],
+                "name": c.get("name", "Unknown"),
+                "profilePic": c.get("profilePic"),
+                "isOnline": c.get("isOnline", False),
+                "lastSeen": c.get("lastSeen")
+            })
+
+        return contacts
+    except Exception as e:
+        print(f"Error in /api/contacts: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
+
+@app.post("/api/chat/add-participant")
+def add_participant(data):
+    participant = {
+        "waId": data.participantWaId,
+        "name": data.participantName or "Unknown",
+        "isAdmin": False,  # Puedes añadir más campos si quieres
+    }
+    result = db.chats.update_one(
+        {"waId": data.groupWaId},
+        {"$addToSet": {"participants": participant}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    return {"status": "participant added", "chatWaId": data.groupWaId, "participant": participant}
+
+@app.post("/api/chat/remove-participant")
+def remove_participant(data):
+    print(data)
+    result = db.chats.update_one(
+        {"waId": data.groupWaId},
+        {"$pull": {"participants": {"waId": data.participantWaId}}}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Chat not found")
+
+    return {"status": "participant removed", "chatWaId": data.groupWaId, "participantWaId": data.participantWaId}
+
+
+
+
 
 @app.get("/api/newcontact")
 def save_contact_file():
@@ -282,29 +481,102 @@ def save_message_file():
     db.messages.insert_one(message_doc)
     return {"status": "inserted", "message": message_doc}
 
-@app.get("/api/addparticipant")
-def add_participant():
-    chat_wa_id = "521234567892"
+@app.post("/api/chat/add-participant/{waId}")
+async def add_participant(
+    waId: str,
+    groupWaId: str = Query(...)
+):
+    chat_doc = db.chats.find_one({"waId": groupWaId})
+    if not chat_doc:
+        raise HTTPException(status_code=404, detail="Group chat not found")
+    if not chat_doc.get("isGroup", False):
+        raise HTTPException(status_code=400, detail="This is not a group chat")
 
-    participant = {
-        "waId": "521234567891",
-        "name": "Test",
-        "color": "#3399ff"
+    # Buscar contacto en contacts
+    contact = db.contacts.find_one({"waId": waId})
+    if not contact:
+        # Opcional: devolver error si no se encuentra el contacto
+        raise HTTPException(status_code=404, detail="Contact not found")
+
+    participant_data = {
+        "waId": contact["waId"],
+        "name": contact.get("name", ""),
+        "profilePic": contact.get("profilePic", "")
     }
 
-    result = db.chats.update_one(
-        {"waId": chat_wa_id},
-        {"$addToSet": {"participants": participant}}  # evita duplicados
+    # Evitar añadir duplicados
+    for p in chat_doc.get("participants", []):
+        if p.get("waId") == waId:
+            return {"success": False, "message": "Participant already in group"}
+
+    updated = db.chats.update_one(
+        {"waId": groupWaId},
+        {"$push": {"participants": participant_data}}
     )
 
-    if result.matched_count == 0:
-        return {"error": "Chat not found", "chatWaId": chat_wa_id}
+    if updated.modified_count == 0:
+        return {"success": False, "message": "Failed to add participant"}
 
-    return {
-        "status": "participant added",
-        "chatWaId": chat_wa_id,
-        "participant": participant
-    }
+    return {"success": True, "message": "Participant added", "participant": participant_data}
+
+
+@app.post("/api/chat/remove-participant/{waId}")
+async def remove_participant(
+    waId: str = Path(..., description="ID del participante a eliminar"),
+    groupWaId: str = Query(..., description="ID del grupo")
+):
+    # Aquí ya tienes ambos valores disponibles
+    chat_doc = db.chats.find_one({"waId": groupWaId})
+    if not chat_doc:
+        raise HTTPException(status_code=404, detail="Group chat not found")
+    if not chat_doc.get("isGroup", False):
+        raise HTTPException(status_code=400, detail="This is not a group chat")
+
+    updated = db.chats.update_one(
+        {"waId": groupWaId},
+        {"$pull": {"participants": {"waId": waId}}}
+    )
+
+    if updated.modified_count == 0:
+        return {"success": False, "message": "Participant not found in group"}
+
+    return {"success": True, "message": "Participant removed"}
+
+@app.post("/api/messages/delete")
+async def delete_message(data: dict = Body(...)):
+    try:
+        message_id = data.get("messageId")
+        requester_id = data.get("requesterId")
+
+        if not message_id or not requester_id:
+            raise HTTPException(status_code=400, detail="Missing messageId or requesterId")
+
+        message = db.messages.find_one({"_id": message_id})
+
+        if not message:
+            raise HTTPException(status_code=404, detail="Message not found")
+
+        if message["sender"] != requester_id:
+            raise HTTPException(status_code=403, detail="You can only delete your own messages")
+
+        # ✨ En vez de eliminarlo, lo actualizamos
+        db.messages.update_one(
+            {"_id": message_id},
+            {"$set": {
+                "content": "Este mensaje se ha borrado",
+                "file": None,
+                "referenceContent": None
+            }}
+        )
+
+        return {"success": True, "message": "Message marked as deleted"}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error updating message: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
 
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
