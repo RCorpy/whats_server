@@ -9,6 +9,9 @@ import os
 import requests
 import shutil
 import uuid
+import hashlib
+import magic
+import subprocess
 from pymongo import MongoClient
 from pydantic import BaseModel
 
@@ -80,7 +83,6 @@ async def save_message_file(
     referenceContent: str = Form(None)
 ):
     try:
-
         # Check if chat is blocked
         chat = db.chats.find_one({"waId": chatId})
         if chat and chat.get("isBlocked") is True:
@@ -91,15 +93,58 @@ async def save_message_file(
         file_name = None
 
         if file:
-            os.makedirs("uploads/messages", exist_ok=True)
+            file_bytes = await file.read()
+            file_hash = hashlib.sha256(file_bytes).hexdigest()
+            mime_type = magic.from_buffer(file_bytes, mime=True)
+
+            # Determine category based on MIME type
+            if mime_type.startswith("image/"):
+                category = "images"
+            elif mime_type.startswith("video/"):
+                category = "videos"
+            else:
+                category = "documents"
+
+            # File paths
+            permanent_dir = os.path.join("uploads", "permanentFiles")
+            temp_dir = os.path.join("uploads", "temporalFiles", category)
+            os.makedirs(permanent_dir, exist_ok=True)
+            os.makedirs(temp_dir, exist_ok=True)
+
+            # Use the hash and original extension for naming
+            ext = os.path.splitext(file.filename)[1]
+            unique_name = f"{file_hash}{ext}"
+
+            # Check if file exists in permanentFiles
+            permanent_path = os.path.join(permanent_dir, unique_name)
+            if os.path.exists(permanent_path):
+                file_url = f"https://bricopoxi.com/uploads/permanentFiles/{unique_name}"
+            else:
+                temp_path = os.path.join(temp_dir, unique_name)
+
+                # Save file if not already saved
+                if not os.path.exists(temp_path):
+                    with open(temp_path, "wb") as f:
+                        f.write(file_bytes)
+
+                    # If it's a video, convert it to WhatsApp-compatible version
+                    if category == "videos":
+                        converted_path = os.path.join(temp_dir, f"{file_hash}_whatsapp.mp4")
+                        success = convert_to_whatsapp_video(temp_path, converted_path)
+
+                    if success and os.path.exists(converted_path):
+                        os.remove(temp_path)  # Remove original unconverted video
+
+                        final_path = os.path.join(temp_dir, f"{file_hash}.mp4")  # New clean name
+                        os.replace(converted_path, final_path)  # Rename without _whatsapp
+
+                        temp_path = final_path
+                        unique_name = f"{file_hash}.mp4"
+
+                file_url = f"https://bricopoxi.com/uploads/temporalFiles/{category}/{unique_name}"
+
             file_name = file.filename
-            unique_name = f"{uuid.uuid4().hex}_{file.filename}"
-            file_path = os.path.join("uploads/messages", unique_name)
 
-            with open(file_path, "wb") as buffer:
-                shutil.copyfileobj(file.file, buffer)
-
-            file_url = f"https://bricopoxi.com/uploads/messages/{unique_name}"
 
         try:
             ts = datetime.fromtimestamp(float(timestamp) / 1000)
@@ -233,33 +278,7 @@ async def get_messages(chat_id: str):
     )
     return messages
 
-def send_whatsapp_message(to, text, message_db_id=None):
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
-    data = {
-        "messaging_product": "whatsapp",
-        "to": to,
-        "type": "text",
-        "text": {"body": text}
-    }
-    response = requests.post(WHATSAPP_API_URL, headers=headers, json=data)
-    print(f"Sent message to {to}, response: {response.status_code} - {response.text}")
-    
-    if response.status_code == 200:
-        try:
-            response_data = response.json()
-            waba_message_id = response_data.get("messages", [{}])[0].get("id")
-            if waba_message_id and message_db_id:
-                db.messages.update_one(
-                    {"_id": message_db_id},
-                    {"$set": {"wabaMessageId": waba_message_id, "status": "sent_to_waba"}}
-                )
-                print(f"Stored WABA message ID {waba_message_id} for DB message {message_db_id}")
-        except Exception as e:
-            print(f"Error parsing WABA response or updating DB with waba_message_id: {e}")
-    return response
+
 
 @app.post("/api/messages/react")
 async def react_to_message(data: dict = Body(...)):
@@ -576,6 +595,60 @@ async def delete_message(data: dict = Body(...)):
     except Exception as e:
         print(f"❌ Error updating message: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
+#FUNTIONS#
+
+def send_whatsapp_message(to, text, message_db_id=None):
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    data = {
+        "messaging_product": "whatsapp",
+        "to": to,
+        "type": "text",
+        "text": {"body": text}
+    }
+    response = requests.post(WHATSAPP_API_URL, headers=headers, json=data)
+    print(f"Sent message to {to}, response: {response.status_code} - {response.text}")
+    
+    if response.status_code == 200:
+        try:
+            response_data = response.json()
+            waba_message_id = response_data.get("messages", [{}])[0].get("id")
+            if waba_message_id and message_db_id:
+                db.messages.update_one(
+                    {"_id": message_db_id},
+                    {"$set": {"wabaMessageId": waba_message_id, "status": "sent_to_waba"}}
+                )
+                print(f"Stored WABA message ID {waba_message_id} for DB message {message_db_id}")
+        except Exception as e:
+            print(f"Error parsing WABA response or updating DB with waba_message_id: {e}")
+    return response
+
+def convert_to_whatsapp_video(input_path: str, output_path: str):
+    try:
+        command = [
+            "ffmpeg",
+            "-i", input_path,
+            "-vf", "scale=w=1280:h=720:force_original_aspect_ratio=decrease",
+            "-c:v", "libx264",
+            "-profile:v", "baseline",
+            "-level", "3.0",
+            "-preset", "fast",
+            "-b:v", "1M",
+            "-c:a", "aac",
+            "-b:a", "128k",
+            "-ar", "44100",
+            "-ac", "1",
+            output_path
+        ]
+        subprocess.run(command, check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"FFmpeg error: {e}")
+        return False
 
 
 
