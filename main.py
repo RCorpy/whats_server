@@ -1,5 +1,5 @@
 from fastapi import FastAPI, Request, HTTPException, Body, UploadFile, File, Form, Query, Path
-from fastapi.responses import PlainTextResponse, JSONResponse
+from fastapi.responses import PlainTextResponse, JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from datetime import datetime
 from bson import ObjectId
@@ -40,6 +40,41 @@ async def root():
         "VERIFY_TOKEN": VERIFY_TOKEN,
         "WHATSAPP_API_URL": WHATSAPP_API_URL
     }
+
+
+
+@app.get("/download/{file_name}")
+def download_file(file_name: str):
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+    UPLOAD_DIR = os.path.join(BASE_DIR, "uploads", "messages")
+    file_path = os.path.join(UPLOAD_DIR, file_name)
+    
+    if not os.path.exists(file_path):
+        UPLOAD_DIR = os.path.join(BASE_DIR, "uploads", "temporalFiles")
+        REAL_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "documents")
+        file_path = os.path.join(REAL_UPLOAD_DIR, file_name)
+
+        if not os.path.exists(file_path):
+            REAL_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "images")
+            file_path = os.path.join(REAL_UPLOAD_DIR, file_name)
+
+            if not os.path.exists(file_path):
+                REAL_UPLOAD_DIR = os.path.join(UPLOAD_DIR, "videos")
+                file_path = os.path.join(REAL_UPLOAD_DIR, file_name)
+
+                if not os.path.exists(file_path):
+                    UPLOAD_DIR = os.path.join(BASE_DIR, "uploads", "permanentFiles")
+                    file_path = os.path.join(UPLOAD_DIR, file_name)
+
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    return FileResponse(
+        path=file_path,
+        filename=file_name,
+        media_type="application/octet-stream",
+        headers={"Content-Disposition": f"attachment; filename={file_name}"}
+    )
 
 @app.get("/webhook", response_class=PlainTextResponse)
 async def verify_webhook(request: Request):
@@ -94,6 +129,7 @@ async def save_message_file(
 
         if file:
             file_bytes = await file.read()
+            print(f"Uploaded file size: {len(file_bytes)} bytes")
             file_hash = hashlib.sha256(file_bytes).hexdigest()
             mime_type = magic.from_buffer(file_bytes, mime=True)
 
@@ -104,6 +140,8 @@ async def save_message_file(
                 category = "videos"
             else:
                 category = "documents"
+
+            print("MIMETYPE",mime_type)
 
             # File paths
             permanent_dir = os.path.join("uploads", "permanentFiles")
@@ -132,14 +170,29 @@ async def save_message_file(
                         converted_path = os.path.join(temp_dir, f"{file_hash}_whatsapp.mp4")
                         success = convert_to_whatsapp_video(temp_path, converted_path)
 
-                    if success and os.path.exists(converted_path):
-                        os.remove(temp_path)  # Remove original unconverted video
+                        if success and os.path.exists(converted_path):
+                            os.remove(temp_path)  # Remove original unconverted video
 
-                        final_path = os.path.join(temp_dir, f"{file_hash}.mp4")  # New clean name
-                        os.replace(converted_path, final_path)  # Rename without _whatsapp
+                            final_path = os.path.join(temp_dir, f"{file_hash}.mp4")  # New clean name
+                            os.replace(converted_path, final_path)  # Rename without _whatsapp
 
-                        temp_path = final_path
-                        unique_name = f"{file_hash}.mp4"
+                            temp_path = final_path
+                            unique_name = f"{file_hash}.mp4"
+
+                    if mime_type.startswith("audio/"):
+                        print("AUDIO DETECTED")
+                        ext = os.path.splitext(file.filename)[1]
+                        temp_path = os.path.join(temp_dir, f"{file_hash}{ext}")
+                        with open(temp_path, "wb") as f:
+                            f.write(file_bytes)
+
+                        # Convert to .ogg
+                        final_name = f"{file_hash}.ogg"
+                        final_path = os.path.join(temp_dir, final_name)
+                        success = convert_audio_to_ogg(temp_path, final_path)
+
+                        if success:
+                            os.remove(temp_path)  # optional
 
                 file_url = f"https://bricopoxi.com/uploads/temporalFiles/{category}/{unique_name}"
 
@@ -650,6 +703,18 @@ def convert_to_whatsapp_video(input_path: str, output_path: str):
         print(f"FFmpeg error: {e}")
         return False
 
-
+def convert_audio_to_ogg(input_path, output_path):
+    try:
+        subprocess.run([
+            "ffmpeg",
+            "-y",  # Overwrite output if exists
+            "-i", input_path,
+            "-c:a", "libvorbis",  # OGG encoding
+            output_path
+        ], check=True)
+        return True
+    except subprocess.CalledProcessError as e:
+        print(f"Audio conversion failed: {e}")
+        return False
 
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
