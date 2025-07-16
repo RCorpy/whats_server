@@ -12,6 +12,7 @@ import uuid
 import hashlib
 import magic
 import subprocess
+import json
 from pymongo import MongoClient
 from pydantic import BaseModel
 
@@ -117,6 +118,23 @@ async def save_message_file(
     file: UploadFile = File(None),
     referenceContent: str = Form(None)
 ):
+
+    def is_audio_only_webm(file_path):
+        try:
+            result = subprocess.run(
+                ["ffprobe", "-v", "error", "-show_streams", "-print_format", "json", file_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            streams = json.loads(result.stdout).get("streams", [])
+            video_streams = [s for s in streams if s.get("codec_type") == "video"]
+            audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+            return len(video_streams) == 0 and len(audio_streams) > 0
+        except Exception as e:
+            print(f"ffprobe error: {e}")
+            return False
+
     try:
         # Check if chat is blocked
         chat = db.chats.find_one({"waId": chatId})
@@ -133,31 +151,47 @@ async def save_message_file(
             file_hash = hashlib.sha256(file_bytes).hexdigest()
             mime_type = magic.from_buffer(file_bytes, mime=True)
 
-            # Determine category based on MIME type
-            if mime_type.startswith("image/"):
-                category = "images"
-            elif mime_type.startswith("video/"):
-                category = "videos"
-            else:
-                category = "documents"
+            print("MIMETYPE", mime_type)
 
-            print("MIMETYPE",mime_type)
-
-            # File paths
+            # Prepare file paths
             permanent_dir = os.path.join("uploads", "permanentFiles")
-            temp_dir = os.path.join("uploads", "temporalFiles", category)
+            base_temp_dir = os.path.join("uploads", "temporalFiles")
             os.makedirs(permanent_dir, exist_ok=True)
-            os.makedirs(temp_dir, exist_ok=True)
+            os.makedirs(base_temp_dir, exist_ok=True)
 
             # Use the hash and original extension for naming
             ext = os.path.splitext(file.filename)[1]
             unique_name = f"{file_hash}{ext}"
 
-            # Check if file exists in permanentFiles
+            # Check for existing file
             permanent_path = os.path.join(permanent_dir, unique_name)
             if os.path.exists(permanent_path):
                 file_url = f"https://bricopoxi.com/uploads/permanentFiles/{unique_name}"
             else:
+                # Temporarily save file for probe
+                probe_temp_path = os.path.join(base_temp_dir, f"{file_hash}_probe{ext}")
+                with open(probe_temp_path, "wb") as f:
+                    f.write(file_bytes)
+
+                # Determine category
+                if mime_type.startswith("image/"):
+                    category = "images"
+                elif mime_type.startswith("video/"):
+                    if is_audio_only_webm(probe_temp_path):
+                        print("🎧 Detected audio-only file (video/webm with only audio stream)")
+                        category = "documents"
+                    else:
+                        category = "videos"
+                elif mime_type.startswith("audio/"):
+                    category = "documents"
+                else:
+                    category = "documents"
+
+                os.remove(probe_temp_path)
+
+                temp_dir = os.path.join(base_temp_dir, category)
+                os.makedirs(temp_dir, exist_ok=True)
+
                 temp_path = os.path.join(temp_dir, unique_name)
 
                 # Save file if not already saved
@@ -165,39 +199,35 @@ async def save_message_file(
                     with open(temp_path, "wb") as f:
                         f.write(file_bytes)
 
-                    # If it's a video, convert it to WhatsApp-compatible version
+                    # If it's a video, convert it
                     if category == "videos":
                         converted_path = os.path.join(temp_dir, f"{file_hash}_whatsapp.mp4")
                         success = convert_to_whatsapp_video(temp_path, converted_path)
 
                         if success and os.path.exists(converted_path):
-                            os.remove(temp_path)  # Remove original unconverted video
-
-                            final_path = os.path.join(temp_dir, f"{file_hash}.mp4")  # New clean name
-                            os.replace(converted_path, final_path)  # Rename without _whatsapp
-
+                            os.remove(temp_path)  # Remove original
+                            final_path = os.path.join(temp_dir, f"{file_hash}.mp4")
+                            os.replace(converted_path, final_path)
                             temp_path = final_path
                             unique_name = f"{file_hash}.mp4"
 
-                    if mime_type.startswith("audio/"):
+                    # If it's audio, convert to .ogg
+                    elif mime_type.startswith("audio/") or (mime_type == "video/webm" and category == "documents"):
                         print("AUDIO DETECTED")
-                        ext = os.path.splitext(file.filename)[1]
                         temp_path = os.path.join(temp_dir, f"{file_hash}{ext}")
                         with open(temp_path, "wb") as f:
                             f.write(file_bytes)
 
-                        # Convert to .ogg
                         final_name = f"{file_hash}.ogg"
                         final_path = os.path.join(temp_dir, final_name)
                         success = convert_audio_to_ogg(temp_path, final_path)
 
                         if success:
-                            os.remove(temp_path)  # optional
+                            os.remove(temp_path)
+                            unique_name = final_name
 
                 file_url = f"https://bricopoxi.com/uploads/temporalFiles/{category}/{unique_name}"
-
-            file_name = file.filename
-
+                file_name = file.filename
 
         try:
             ts = datetime.fromtimestamp(float(timestamp) / 1000)
@@ -245,6 +275,8 @@ async def save_message_file(
     except Exception as e:
         print(f"❌ Error saving message: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
+
+
 
 @app.get("/api/chats")
 async def get_chats_api():
