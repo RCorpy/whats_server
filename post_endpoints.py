@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, Form, File, UploadFile, HTTPException, Body, Query, Path
+from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Body, Query, Path
 from datetime import datetime
 
 from functions import send_whatsapp_message, convert_to_whatsapp_video, convert_audio_to_ogg
@@ -11,30 +11,6 @@ import subprocess
 import json
 
 def register_post_endpoints(app: FastAPI):
-    @app.post("/webhook")
-    async def receive_webhook(request: Request):
-        try:
-            body = await request.json()
-            print("🔔 Received webhook payload:", body)
-
-            entry = body["entry"][0]
-            changes = entry["changes"][0]
-            value = changes["value"]
-            messages = value.get("messages", [])
-
-            if messages:
-                message = messages[0]
-                from_number = message["from"]
-                text = message["text"]["body"]
-                print(f"Message from {from_number}: {text}")
-
-                send_whatsapp_message(from_number, "✅ Message received! Thanks for contacting us.")
-
-        except Exception as e:
-            print(f"❌ Error parsing webhook data: {e}")
-
-        return {"status": "received"}
-
     @app.post("/api/messages")
     async def save_message_file(
         id: str = Form(...),
@@ -201,6 +177,41 @@ def register_post_endpoints(app: FastAPI):
 
         except Exception as e:
             print(f"❌ Error saving message: {e}")
+            raise HTTPException(status_code=500, detail="Internal server error")
+
+    @app.post("/api/messages/delete")
+    async def delete_message(data: dict = Body(...)):
+        try:
+            message_id = data.get("messageId")
+            requester_id = data.get("requesterId")
+
+            if not message_id or not requester_id:
+                raise HTTPException(status_code=400, detail="Missing messageId or requesterId")
+
+            message = db.messages.find_one({"_id": message_id})
+
+            if not message:
+                raise HTTPException(status_code=404, detail="Message not found")
+
+            if message["sender"] != requester_id:
+                raise HTTPException(status_code=403, detail="You can only delete your own messages")
+
+            # ✨ En vez de eliminarlo, lo actualizamos
+            db.messages.update_one(
+                {"_id": message_id},
+                {"$set": {
+                    "content": "Este mensaje se ha borrado",
+                    "file": None,
+                    "referenceContent": None
+                }}
+            )
+
+            return {"success": True, "message": "Message marked as deleted"}
+
+        except HTTPException:
+            raise
+        except Exception as e:
+            print(f"❌ Error updating message: {e}")
             raise HTTPException(status_code=500, detail="Internal server error")
 
     @app.post("/api/messages/react")
@@ -388,37 +399,4 @@ def register_post_endpoints(app: FastAPI):
         return {"success": True, "message": "Participant removed"}
 
 
-    @app.post("/api/messages/delete")
-    async def delete_message(data: dict = Body(...)):
-        try:
-            message_id = data.get("messageId")
-            requester_id = data.get("requesterId")
-
-            if not message_id or not requester_id:
-                raise HTTPException(status_code=400, detail="Missing messageId or requesterId")
-
-            message = db.messages.find_one({"_id": message_id})
-
-            if not message:
-                raise HTTPException(status_code=404, detail="Message not found")
-
-            if message["sender"] != requester_id:
-                raise HTTPException(status_code=403, detail="You can only delete your own messages")
-
-            # ✨ En vez de eliminarlo, lo actualizamos
-            db.messages.update_one(
-                {"_id": message_id},
-                {"$set": {
-                    "content": "Este mensaje se ha borrado",
-                    "file": None,
-                    "referenceContent": None
-                }}
-            )
-
-            return {"success": True, "message": "Message marked as deleted"}
-
-        except HTTPException:
-            raise
-        except Exception as e:
-            print(f"❌ Error updating message: {e}")
-            raise HTTPException(status_code=500, detail="Internal server error")
+    
