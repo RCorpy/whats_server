@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Body, Query, Path
 from datetime import datetime
 
-from functions import send_whatsapp_message, convert_to_whatsapp_video, convert_audio_to_ogg
+from functions import convert_to_whatsapp_video, convert_audio_to_ogg
 from db import db
 
 import hashlib

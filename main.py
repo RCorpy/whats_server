@@ -1,6 +1,8 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from dotenv import load_dotenv
+from fastapi.middleware.cors import CORSMiddleware
 
 
 from pydantic import BaseModel
@@ -8,21 +10,56 @@ from pydantic import BaseModel
 from get_endpoints import register_get_endpoints
 from post_endpoints import register_post_endpoints
 from whatsapp_api import register_whatsapp_endpoints
-from functions import register_functions
+from sse import push_to_clients
 
 #imports for force
 
 from datetime import datetime
 from db import db
 import uuid
+import asyncio
+
+from sse import connected_clients
 
 load_dotenv()
 app = FastAPI()
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Or your frontend URL
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 register_get_endpoints(app)
 register_post_endpoints(app)
 register_whatsapp_endpoints(app)
-register_functions()
+
+
+@app.get("/sse")
+async def sse_endpoint(request: Request):
+    queue = asyncio.Queue()
+    connected_clients.append(queue)
+
+    async def event_stream():
+        print("event_streaming")
+        try:
+            #yield "retry: 10000\n\n"
+            while True:
+                try:
+                    data = await asyncio.wait_for(queue.get(), timeout=25)
+                    yield f"data: {data}\n\n"
+                except asyncio.TimeoutError:
+                    # 🔁 Send heartbeat to keep connection alive
+                    yield ": ping\n\n"
+        except asyncio.CancelledError:
+            print("💤 Client disconnected")
+        finally:
+            connected_clients.remove(queue)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 @app.get("/api/forcenewcontact")
 def save_contact_file():
