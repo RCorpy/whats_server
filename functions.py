@@ -2,7 +2,8 @@ import os
 import subprocess
 import requests
 import uuid
-
+import json
+import asyncio
 
 from db import db
 from dotenv import load_dotenv
@@ -16,12 +17,9 @@ VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL")
 
 
-def send_whatsapp_message(to, text=None, reaction=None, reply_to=None):
-    headers = {
-        "Authorization": f"Bearer {ACCESS_TOKEN}",
-        "Content-Type": "application/json"
-    }
+def send_whatsapp_message(to, text=None, reaction=None, reply_to=None, media_type=None, media_url=None, media_filename=None):
 
+    
     if reaction:
         data = {
             "messaging_product": "whatsapp",
@@ -32,6 +30,26 @@ def send_whatsapp_message(to, text=None, reaction=None, reply_to=None):
                 "emoji": reaction
             }
         }
+        content = f"[reaction] {reaction}"
+
+    elif media_type and media_url:
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to,
+            "type": media_type,
+            media_type: {
+                "link": media_url
+            }
+        }
+        if media_type == "document" and media_filename:
+            data[media_type]["filename"] = media_filename
+
+        if reply_to:
+            data["context"] = {"message_id": reply_to}
+
+        content = f"[{media_type}] {media_url}"
+
+
     else:
         data = {
             "messaging_product": "whatsapp",
@@ -41,46 +59,89 @@ def send_whatsapp_message(to, text=None, reaction=None, reply_to=None):
         }
         if reply_to:
             data["context"] = {"message_id": reply_to}
+        content = text
+
+    response = send_to_whatsapp_api(data)
+    waba_id = extract_waba_message_id(response)
+    save_message_to_db(
+        to=to,
+        sender="me",
+        content=content,
+        reference_id=reply_to,
+        waba_id=waba_id
+    )
+
+    return response
+
+
+# SEND MESSAGE PARTS
+
+def send_to_whatsapp_api(data):
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}",
+        "Content-Type": "application/json"
+    }
 
     try:
         response = requests.post(WHATSAPP_API_URL, headers=headers, json=data)
-        print(f"📤 Sent to {to} | Status: {response.status_code} | {response.text}")
+        print(f"📤 Sent to WhatsApp API | Status: {response.status_code} | {response.text}")
+        return response
     except Exception as e:
-        print(f"❌ Failed to send message to {to}: {e}")
+        print(f"❌ Error sending to WhatsApp API: {e}")
         return None
 
-    if response.status_code == 200:
-        try:
-            message_id = str(uuid.uuid4())
-            now_iso = datetime.utcnow().isoformat() + "Z"
+def extract_waba_message_id(response):
+    try:
+        if response and response.status_code == 200:
+            response_data = response.json()
+            return response_data.get("messages", [{}])[0].get("id")
+    except Exception as e:
+        print(f"⚠️ Could not extract WABA message ID: {e}")
+    return None
 
-            db_entry = {
-                "_id": message_id,
-                "chatWaId": to,
-                "sender": "me",
-                "content": None if reaction else text,
+def save_message_to_db(to, sender, content, file=None, file_name=None, reference_id=None, waba_id=None):
+    ensure_chat_exists(to)  # 💬 Make sure chat exists before saving the message
+
+    message_id = str(uuid.uuid4())
+    now_iso = datetime.utcnow()
+
+    db_entry = {
+        "_id": message_id,
+        "chatWaId": to,
+        "sender": sender,
+        "content": content,
+        "timestamp": {"$date": now_iso},
+        "status": "sent",
+        "file": file,
+        "fileName": file_name,
+        "referenceContent": reference_id
+    }
+
+    if waba_id:
+        db_entry["wabaMessageId"] = waba_id
+
+    db.messages.insert_one(db_entry)
+
+    # Optionally update the chat with the last message and timestamp
+    db.chats.update_one(
+        {"waId": to},
+        {
+            "$set": {
+                "lastMessage": content,
                 "timestamp": {"$date": now_iso},
-                "status": "sent",
-                "file": None,
-                "fileName": None,
-                "referenceContent": reply_to if reply_to else None
+                "unreadCount": 0  # This might change if it's incoming
             }
+        }
+    )
 
-            if reaction:
-                db_entry["content"] = f"[reaction] {reaction}"
+    # Send to frontend
+    payload = json.dumps(db_entry, default=str)
+    for client in connected_clients:
+        asyncio.create_task(await_safe_put(client, payload))
 
-            db.messages.insert_one(db_entry)
+    return message_id
 
-            # Send to frontend
-            payload = json.dumps(db_entry, default=str)
-            for client in connected_clients:
-                asyncio.create_task(await_safe_put(client, payload))
 
-            return response
-
-        except Exception as e:
-            print(f"⚠️ Could not save or broadcast message: {e}")
-    return response
 
 
 def convert_to_whatsapp_video(input_path: str, output_path: str):
@@ -120,9 +181,38 @@ def convert_audio_to_ogg(input_path, output_path):
         print(f"Audio conversion failed: {e}")
         return False
 
+def ensure_chat_exists(wa_id, is_group=False, group_name=None):
+    existing_chat = db.chats.find_one({"waId": wa_id})
+    if existing_chat:
+        return existing_chat["_id"]
+
+    now_iso = datetime.utcnow()
+    chat_data = {
+        "_id": uuid.uuid4().hex,
+        "waId": wa_id,
+        "isGroup": is_group,
+        "groupName": group_name,
+        "lastMessage": "",
+        "participants": [],
+        "timestamp": {"$date": now_iso},
+        "unreadCount": 0,
+        "isTyping": False,
+        "isMuted": False,
+        "isPinned": False,
+        "isBlocked": False
+    }
+
+    db.chats.insert_one(chat_data)
+    print(f"💬 Created new chat with {wa_id}")
+    return chat_data["_id"]
 
 
 
+async def await_safe_put(client, data):
+    try:
+        await client.put(data)
+    except Exception as e:
+        print(f"⚠️ Failed to push to client: {e}")
 
 
 

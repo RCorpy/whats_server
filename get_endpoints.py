@@ -97,7 +97,24 @@ def register_get_endpoints(app: FastAPI):
                     else:
                         chat_name = wa_id
 
-                timestamp_dt = chat_doc.get("timestamp", datetime.utcnow())
+                timestamp_raw = chat_doc.get("timestamp", datetime.utcnow())
+                if isinstance(timestamp_raw, datetime):
+                    timestamp_dt = timestamp_raw
+
+                elif isinstance(timestamp_raw, dict) and "$date" in timestamp_raw:
+                    try:
+                        timestamp_dt = datetime.fromisoformat(timestamp_raw["$date"].replace("Z", "+00:00"))
+                    except Exception:
+                        timestamp_dt = datetime.utcnow()  # fallback if parsing fails
+
+                elif isinstance(timestamp_raw, str):
+                    try:
+                        timestamp_dt = datetime.fromisoformat(timestamp_raw.replace("Z", "+00:00"))
+                    except Exception:
+                        timestamp_dt = datetime.utcnow()  # fallback if parsing fails
+
+                else:
+                    timestamp_dt = datetime.utcnow()  # final fallback
 
                 response_chats.append({
                     "id": wa_id,
@@ -121,18 +138,40 @@ def register_get_endpoints(app: FastAPI):
             traceback.print_exc()
             raise HTTPException(status_code=500, detail="Internal Server Error")
 
+    from datetime import datetime
+
     @app.get("/api/messages/{chat_id}")
     async def get_messages(chat_id: str):
         messages_cursor = db.messages.find({"chatWaId": chat_id})
 
         messages = []
         for msg in messages_cursor:
+            # Fix timestamp parsing
+            timestamp_raw = msg.get("timestamp", datetime.utcnow())
+            if isinstance(timestamp_raw, datetime):
+                timestamp_dt = timestamp_raw
+
+            elif isinstance(timestamp_raw, dict) and "$date" in timestamp_raw:
+                try:
+                    timestamp_dt = datetime.fromisoformat(timestamp_raw["$date"].replace("Z", "+00:00"))
+                except Exception:
+                    timestamp_dt = datetime.utcnow()  # fallback if parsing fails
+
+            elif isinstance(timestamp_raw, str):
+                try:
+                    timestamp_dt = datetime.fromisoformat(timestamp_raw.replace("Z", "+00:00"))
+                except Exception:
+                    timestamp_dt = datetime.utcnow()  # fallback if parsing fails
+
+            else:
+                timestamp_dt = datetime.utcnow()  # final fallback
+
             messages.append({
                 "id": str(msg["_id"]),
                 "chatId": msg["chatWaId"],
                 "senderId": msg["sender"],
                 "content": msg.get("content"),
-                "timestamp": msg["timestamp"].timestamp() * 1000,
+                "timestamp": int(timestamp_dt.timestamp() * 1000),
                 "status": msg["status"],
                 "file": msg.get("file"),
                 "fileName": msg.get("fileName"),
@@ -145,6 +184,7 @@ def register_get_endpoints(app: FastAPI):
             {"$set": {"unreadCount": 0}}
         )
         return messages
+
 
 
     @app.get("/api/contacts")

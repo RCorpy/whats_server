@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Body, Query, Path
 from datetime import datetime
 
-from functions import convert_to_whatsapp_video, convert_audio_to_ogg
+from functions import convert_to_whatsapp_video, convert_audio_to_ogg, send_whatsapp_message
 from db import db
 
 import hashlib
@@ -162,6 +162,34 @@ def register_post_endpoints(app: FastAPI):
                 },
                 upsert=True
             )
+            
+            # Send the message to the WhatsApp API
+            try:
+                if file_url:
+                    # Determine media type from file extension
+                    if file_url.endswith(('.jpg', '.jpeg', '.png')):
+                        media_type = "image"
+                    elif file_url.endswith('.mp4'):
+                        media_type = "video"
+                    elif file_url.endswith('.ogg'):
+                        media_type = "audio"
+                    else:
+                        media_type = "document"
+
+                    send_whatsapp_message(
+                        to=chatId,
+                        media_type=media_type,
+                        media_url=file_url,
+                        media_filename=file_name
+                    )
+                elif content:
+                    send_whatsapp_message(
+                        to=chatId,
+                        text=content
+                    )
+            except Exception as e:
+                print(f"❌ Failed to send message to WhatsApp API: {e}")
+
 
             return {
                 "id": id,
