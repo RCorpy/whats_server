@@ -39,11 +39,13 @@ def register_post_endpoints(app: FastAPI):
                 return False
 
         try:
+            # Check if the messsage
             # Check if chat is blocked
             chat = db.chats.find_one({"waId": chatId})
             if chat and chat.get("isBlocked") is True:
                 print(f"⚠️ Message to blocked chat {chatId} ignored.")
                 raise HTTPException(status_code=403, detail="This chat is blocked. Message not saved.")
+
 
             file_url = None
             file_name = None
@@ -130,6 +132,7 @@ def register_post_endpoints(app: FastAPI):
                                 unique_name = final_name
 
                     file_url = f"https://bricopoxi.com/uploads/temporalFiles/{category}/{unique_name}"
+                    local_file_path = os.path.join("uploads", "temporalFiles", category, unique_name)
                     file_name = file.filename
 
             try:
@@ -179,7 +182,7 @@ def register_post_endpoints(app: FastAPI):
                     send_whatsapp_message(
                         to=chatId,
                         media_type=media_type,
-                        media_url=file_url,
+                        media_url=local_file_path,
                         media_filename=file_name
                     )
                 elif content:

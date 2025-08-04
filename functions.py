@@ -4,6 +4,7 @@ import requests
 import uuid
 import json
 import asyncio
+import mimetypes
 
 from db import db
 from dotenv import load_dotenv
@@ -15,11 +16,11 @@ load_dotenv()
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL")
+YOUR_PHONE_NUMBER_ID = "673231622536362"
 
 
-def send_whatsapp_message(to, text=None, reaction=None, reply_to=None, media_type=None, media_url=None, media_filename=None):
+def send_whatsapp_message(to, text=None, reaction=None, reply_to=None, media_type=None, media_url=None, media_filename=None, auto_save=False):
 
-    
     if reaction:
         data = {
             "messaging_product": "whatsapp",
@@ -33,14 +34,30 @@ def send_whatsapp_message(to, text=None, reaction=None, reply_to=None, media_typ
         content = f"[reaction] {reaction}"
 
     elif media_type and media_url:
+        # Assume media_url is a local path to file, not a public link
+        mime_type = get_mime_type(media_url)  # You can use mimetypes module
+        media_id = upload_media_to_whatsapp(media_url, mime_type)
+        
+        if not media_id:
+            print("❌ Failed to upload media to WhatsApp")
+            return None
+
         data = {
             "messaging_product": "whatsapp",
             "to": to,
             "type": media_type,
             media_type: {
-                "link": media_url
+                "id": media_id
             }
         }
+        if media_type == "document" and media_filename:
+            data[media_type]["filename"] = media_filename
+
+        if reply_to:
+            data["context"] = {"message_id": reply_to}
+
+        content = f"[{media_type}] {media_filename or media_url}"
+
         if media_type == "document" and media_filename:
             data[media_type]["filename"] = media_filename
 
@@ -63,13 +80,14 @@ def send_whatsapp_message(to, text=None, reaction=None, reply_to=None, media_typ
 
     response = send_to_whatsapp_api(data)
     waba_id = extract_waba_message_id(response)
-    save_message_to_db(
-        to=to,
-        sender="me",
-        content=content,
-        reference_id=reply_to,
-        waba_id=waba_id
-    )
+    if auto_save:
+        save_message_to_db(
+            to=to,
+            sender="me",
+            content=content,
+            reference_id=reply_to,
+            waba_id=waba_id
+        )
 
     return response
 
@@ -215,5 +233,28 @@ async def await_safe_put(client, data):
         print(f"⚠️ Failed to push to client: {e}")
 
 
+def upload_media_to_whatsapp(file_path, mime_type):
+    url = f"https://graph.facebook.com/v19.0/{YOUR_PHONE_NUMBER_ID}/media"  # Replace with actual phone number ID
+    headers = {
+        "Authorization": f"Bearer {ACCESS_TOKEN}"
+    }
+
+    with open(file_path, 'rb') as f:
+        files = {
+            'file': (os.path.basename(file_path), f, mime_type)
+        }
+        data = {
+            'messaging_product': 'whatsapp'
+        }
+
+        response = requests.post(url, headers=headers, files=files, data=data)
+        print(f"📤 Upload media response: {response.status_code} - {response.text}")
+
+        if response.status_code == 200:
+            return response.json().get('id')  # media_id
+        return None
 
 
+def get_mime_type(file_path):
+    mime_type, _ = mimetypes.guess_type(file_path)
+    return mime_type or 'application/octet-stream'

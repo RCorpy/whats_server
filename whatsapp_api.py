@@ -23,6 +23,10 @@ def register_whatsapp_endpoints(app: FastAPI):
             if messages:
                 message = messages[0]
                 from_number = message["from"]
+                #print("look for this", from_number, waba_id)
+                #if from_number == waba_id:
+                #    print("↩️ Ignored own outgoing message echoed back from WhatsApp.")
+                #    return {"status": "ignored"}
                 text = message["text"]["body"]
 
                 print(f"💬 Incoming message from {from_number}: {text}")
@@ -39,7 +43,7 @@ def register_whatsapp_endpoints(app: FastAPI):
                     waba_id=message["id"] if "id" in message else None
                 )
                 # Optional auto-reply
-                send_whatsapp_message(from_number, "✅ Message received! Thanks for contacting us.")
+                send_whatsapp_message(from_number, "✅ Message received! Thanks for contacting us.", auto_save=True)
 
         except Exception as e:
             print(f"❌ Error parsing webhook data: {e}")
