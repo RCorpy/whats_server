@@ -11,12 +11,15 @@ from dotenv import load_dotenv
 from sse import connected_clients
 from datetime import datetime
 
+from PIL import Image
+from io import BytesIO
+
 load_dotenv()
 
 ACCESS_TOKEN = os.getenv("ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN")
 WHATSAPP_API_URL = os.getenv("WHATSAPP_API_URL")
-YOUR_PHONE_NUMBER_ID = "673231622536362"
+YOUR_PHONE_NUMBER_ID = os.getenv("PHONE_NUMBER_ID")
 
 
 def send_whatsapp_message(to, text=None, reaction=None, reply_to=None, media_type=None, media_url=None, media_filename=None, auto_save=False):
@@ -191,12 +194,15 @@ def convert_audio_to_ogg(input_path, output_path):
             "ffmpeg",
             "-y",  # Overwrite output if exists
             "-i", input_path,
-            "-c:a", "libvorbis",  # OGG encoding
+            "-c:a", "libopus",  # ✅ Opus codec for WhatsApp
+            "-b:a", "64k",      # Optional: audio bitrate
+            "-vn",              # No video
+            "-f", "ogg",        # Ensure Ogg container
             output_path
         ], check=True)
         return True
     except subprocess.CalledProcessError as e:
-        print(f"Audio conversion failed: {e}")
+        print(f"❌ Audio conversion failed: {e}")
         return False
 
 def ensure_chat_exists(wa_id, is_group=False, group_name=None):
@@ -234,7 +240,7 @@ async def await_safe_put(client, data):
 
 
 def upload_media_to_whatsapp(file_path, mime_type):
-    url = f"https://graph.facebook.com/v19.0/{YOUR_PHONE_NUMBER_ID}/media"  # Replace with actual phone number ID
+    url = f"https://graph.facebook.com/v19.0/{os.getenv('PHONE_NUMBER_ID')}/media"  # Replace with actual phone number ID
     headers = {
         "Authorization": f"Bearer {ACCESS_TOKEN}"
     }
@@ -244,7 +250,8 @@ def upload_media_to_whatsapp(file_path, mime_type):
             'file': (os.path.basename(file_path), f, mime_type)
         }
         data = {
-            'messaging_product': 'whatsapp'
+            'messaging_product': 'whatsapp',
+            'type': mime_type
         }
 
         response = requests.post(url, headers=headers, files=files, data=data)
@@ -258,3 +265,15 @@ def upload_media_to_whatsapp(file_path, mime_type):
 def get_mime_type(file_path):
     mime_type, _ = mimetypes.guess_type(file_path)
     return mime_type or 'application/octet-stream'
+
+
+
+def sanitize_image(image_bytes, output_path):
+    try:
+        with Image.open(BytesIO(image_bytes)) as img:
+            rgb_image = img.convert("RGB")  # Ensure RGB format
+            rgb_image.save(output_path, format="JPEG", quality=85)
+        return True
+    except Exception as e:
+        print(f"❌ Failed to sanitize image: {e}")
+        return False

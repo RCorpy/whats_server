@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Form, File, UploadFile, HTTPException, Body, Query, Path
 from datetime import datetime
 
-from functions import convert_to_whatsapp_video, convert_audio_to_ogg, send_whatsapp_message
+from functions import convert_to_whatsapp_video, convert_audio_to_ogg, send_whatsapp_message, sanitize_image
 from db import db
+
 
 import hashlib
 import os
@@ -81,6 +82,25 @@ def register_post_endpoints(app: FastAPI):
                     # Determine category
                     if mime_type.startswith("image/"):
                         category = "images"
+                        temp_dir = os.path.join(base_temp_dir, category)
+                        os.makedirs(temp_dir, exist_ok=True)
+
+                        sanitized_name = f"{file_hash}.jpg"
+                        sanitized_path = os.path.join(temp_dir, sanitized_name)
+
+                        success = sanitize_image(file_bytes, sanitized_path)
+
+                        if success:
+                            unique_name = sanitized_name
+                            temp_path = sanitized_path
+                        else:
+                            print("⚠️ Falling back to original image without sanitization.")
+                            fallback_path = os.path.join(temp_dir, unique_name)
+                            with open(fallback_path, "wb") as f:
+                                f.write(file_bytes)
+                            temp_path = fallback_path
+
+
                     elif mime_type.startswith("video/"):
                         if is_audio_only_webm(probe_temp_path):
                             print("🎧 Detected audio-only file (video/webm with only audio stream)")
