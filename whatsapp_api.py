@@ -108,7 +108,18 @@ def download_media(media_id, mime_type=None, file_name=None):
         extension = extension[1:]
 
     # 4. Prepare save directory
-    save_dir = "uploads/temporalFiles/images"
+    media_type_to_folder = {
+        "image": "images",
+        "video": "videos",
+        "audio": "documents",   # ← audio goes with documents
+        "document": "documents"
+    }
+    # Extract media type from MIME type if not directly provided
+    # Example: mime_type = "image/jpeg" → media_category = "image"
+    media_category = mime_type.split("/")[0] if mime_type else "documents"
+    save_subdir = media_type_to_folder.get(media_category, "documents")
+
+    save_dir = os.path.join("uploads", "temporalFiles", save_subdir)
     os.makedirs(save_dir, exist_ok=True)
 
     # 5. Filename handling
@@ -122,4 +133,4 @@ def download_media(media_id, mime_type=None, file_name=None):
     with open(full_path, "wb") as f:
         f.write(media_file_response.content)
 
-    return os.path.join("https://bricopoxi.com",full_path)
+    return f"https://bricopoxi.com/{full_path}"
